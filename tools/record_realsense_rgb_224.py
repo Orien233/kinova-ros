@@ -165,7 +165,7 @@ class RGBRecorder:
 
 
 
-        # 仅启用 RGB
+        # Enable RGB stream only
 
 
         self.config.enable_stream(
@@ -239,13 +239,13 @@ class RGBRecorder:
         """
 
 
-        先从原图中心裁出一个正方形区域。
+        First crop a centered square region from the source image.
 
 
-        center_ratio=1.0 表示取最大中心正方形；
+        center_ratio=1.0 means taking the maximum centered square.
 
 
-        center_ratio<1.0 表示只取更小的中心区域。
+        center_ratio<1.0 means taking a smaller centered region.
 
 
         """
@@ -262,7 +262,7 @@ class RGBRecorder:
 
 
 
-        # 保证最终裁剪边长至少 >= output_size
+        # Ensure final crop side length is >= output_size
 
 
         crop_side = max(crop_side, self.output_size)
@@ -295,7 +295,7 @@ class RGBRecorder:
 
 
 
-        # 边界修正
+        # Boundary correction
 
 
         if x2 > w:
@@ -329,10 +329,10 @@ class RGBRecorder:
         """
 
 
-        中心裁剪 + 面积插值缩小到 224x224。
+        Center-crop then downsample to 224x224 using area interpolation.
 
 
-        INTER_AREA 适合图像缩小场景，可理解为一种像素面积融合/重采样。
+        INTER_AREA is suitable for downscaling (pixel-area resampling).
 
 
         """
@@ -509,7 +509,7 @@ class RGBRecorder:
 
 
 
-        # 给相机一点预热时间
+        # Allow camera warm-up time
 
 
         for _ in range(10):
@@ -580,7 +580,7 @@ class RGBRecorder:
 
 
 
-                # 到保存时间了：取当前帧
+                # Save time reached: capture current frame
 
 
                 bgr = np.asanyarray(color_frame.get_data())
@@ -650,7 +650,7 @@ class RGBRecorder:
 
 
 
-                # 防止漂移：按固定周期推进
+                # Prevent timing drift: advance on fixed period
 
 
                 while self.next_save_time <= now_mono:

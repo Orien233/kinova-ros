@@ -4,14 +4,14 @@
 """
 Sequence recorder for Kinova Gen2 J2S6S300.
 
-这一版同时服务于两条播放链路：
-1. velocity / Jacobian 回放：输出 raw delta / normalized delta。
-2. position / pose-action 回放：额外输出 absolute pose 序列，减少 delta 累积误差。
+This version supports two playback pipelines:
+1. velocity/Jacobian playback: outputs raw delta and normalized delta.
+2. position/pose-action playback: additionally outputs absolute pose sequence to reduce delta accumulation error.
 
-本次对齐修改：
-- 所有默认输出文件都落到“脚本所在目录”而不是当前工作目录。
-- teach / auto 若显式传入输出路径，则仍按传入路径写入。
-- 默认会同时生成：
+Current alignment updates:
+- All default output files are written under the script directory instead of CWD.
+- teach/auto still respect explicitly provided output paths.
+- By default it generates:
   sequence.txt / sequence_raw.txt / sequence_pose.txt / sequence_debug.csv / sequence_stats.json
 """
 
@@ -150,7 +150,7 @@ class SequenceRecorder(object):
         if HAS_FINGER_POSITION_MSG:
             rospy.Subscriber(self.finger_topic, FingerPosition, self._finger_cb, queue_size=1)
         else:
-            rospy.logwarn('kinova_msgs/FingerPosition 不可导入，将仅使用 joint_state 估计夹爪状态。')
+            rospy.logwarn('kinova_msgs/FingerPosition is unavailable; gripper state will be estimated from joint_state only.')
 
         rospy.loginfo('SequenceRecorder initialized.')
         rospy.loginfo('robot_type           = %s', self.robot_type)
@@ -482,7 +482,7 @@ class SequenceRecorder(object):
         if not self.auto_force_control:
             return
         if not HAS_EMPTY_SRV:
-            rospy.logwarn('std_srvs/Empty 不可用，无法自动切换 force control。')
+            rospy.logwarn('std_srvs/Empty is unavailable; cannot auto-switch force control.')
             return
         service_name = self.start_force_control_srv if enable else self.stop_force_control_srv
         try:

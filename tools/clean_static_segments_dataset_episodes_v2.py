@@ -136,18 +136,18 @@ def try_prune_sidecar_csv(path: Path, keep_indices: List[int], expected_len: int
     try:
         rows, fieldnames = read_csv_rows(path)
     except Exception as e:
-        print(f'  [警告] 读取 CSV 失败 {path.name}: {e}')
+        print(f'  [WARN] Failed to read CSV {path.name}: {e}')
         return
     if len(rows) != expected_len:
-        print(f'  [跳过 sidecar CSV] {path.name}: 行数={len(rows)}，与主序列={expected_len} 不一致')
+        print(f'  [Skip sidecar CSV] {path.name}: rows={len(rows)}，vs main sequence={expected_len} mismatch')
         return
     if not apply:
-        print(f'  [dry-run] 将同步裁剪 CSV: {path}')
+        print(f'  [dry-run] Will prune CSV in sync: {path}')
         return
     backup_file(path, backup_root)
     new_rows = prune_by_indices(rows, keep_indices)
     write_csv_rows(path, new_rows, fieldnames)
-    print(f'  [CSV已裁剪] {path}')
+    print(f'  [CSV pruned] {path}')
 
 
 def try_prune_sidecar_txt(path: Path, keep_indices: List[int], expected_len: int, backup_root: Path, apply: bool) -> None:
@@ -156,18 +156,18 @@ def try_prune_sidecar_txt(path: Path, keep_indices: List[int], expected_len: int
     except UnicodeDecodeError:
         lines = path.read_text(encoding='utf-8-sig').splitlines()
     except Exception as e:
-        print(f'  [警告] 读取 TXT 失败 {path.name}: {e}')
+        print(f'  [WARN] Failed to read TXT {path.name}: {e}')
         return
     if len(lines) != expected_len:
-        print(f'  [跳过 sidecar TXT] {path.name}: 行数={len(lines)}，与主序列={expected_len} 不一致')
+        print(f'  [Skip sidecar TXT] {path.name}: rows={len(lines)}，vs main sequence={expected_len} mismatch')
         return
     if not apply:
-        print(f'  [dry-run] 将同步裁剪 TXT: {path}')
+        print(f'  [dry-run] Will prune TXT in sync: {path}')
         return
     backup_file(path, backup_root)
     new_lines = prune_by_indices(lines, keep_indices)
     path.write_text('\n'.join(new_lines) + ('\n' if new_lines else ''), encoding='utf-8')
-    print(f'  [TXT已裁剪] {path}')
+    print(f'  [TXT pruned] {path}')
 
 
 def is_episode_dir(ep_dir: Path, action_rel: str, image_rel: str) -> bool:
@@ -176,11 +176,11 @@ def is_episode_dir(ep_dir: Path, action_rel: str, image_rel: str) -> bool:
 
 def collect_episode_dirs(root: Path, action_rel: str, image_rel: str, episode_prefix: str, recursive: bool = True) -> List[Path]:
     """
-    改进点：
-    1. 先检查 root 自身是否就是 episode
-    2. 再检查 root 的直接子目录
-    3. 最后递归搜索任意深度下的 trajectory/sequence_debug.csv，再反推 episode 目录
-    这样即使 dataset_episodes 下又套了一层目录，也能找到。
+    Improvements:
+    1. 1. Check whether root itself is an episode
+    2. 2. Check direct child directories under root
+    3. 3. Recursively search trajectory/sequence_debug.csv and infer episode dirs
+    This still works when dataset_episodes has nested directories.
     """
     found: List[Path] = []
     seen = set()
@@ -190,8 +190,8 @@ def collect_episode_dirs(root: Path, action_rel: str, image_rel: str, episode_pr
         if rp in seen:
             return
         if episode_prefix and episode_prefix not in ep.name:
-            # 不强制必须以 episode_ 开头，但至少给一个弱约束；
-            # 若用户不想限制可传 --episode-prefix ''
+            # No hard requirement to start with episode_, but keep weak filtering;
+            # pass --episode-prefix "" to disable filtering
             pass
         if is_episode_dir(ep, action_rel, image_rel):
             found.append(ep)
@@ -201,7 +201,7 @@ def collect_episode_dirs(root: Path, action_rel: str, image_rel: str, episode_pr
 
     for p in sorted([x for x in root.iterdir() if x.is_dir()], key=lambda x: natural_key(x.name)):
         if episode_prefix and not p.name.startswith(episode_prefix):
-            # 直接子目录层保留前缀过滤
+            # Keep prefix filtering at direct child level
             continue
         add_candidate(p)
 
@@ -246,26 +246,26 @@ def process_episode(
     raw_txt_file = ep_dir / raw_txt_rel if raw_txt_rel else None
 
     if not action_file.is_file():
-        print(f'[跳过] {ep_dir}: 未找到动作文件 -> {action_file}')
+        print(f'[Skip] {ep_dir}: action file not found -> {action_file}')
         return
     if not image_dir.is_dir():
-        print(f'[跳过] {ep_dir}: 未找到图片目录 -> {image_dir}')
+        print(f'[Skip] {ep_dir}: image directory not found -> {image_dir}')
         return
 
     images = list_images_sorted(image_dir)
     if not images:
-        print(f'[跳过] {ep_dir}: 图片目录为空 -> {image_dir}')
+        print(f'[Skip] {ep_dir}: image directory is empty -> {image_dir}')
         return
 
     try:
         rows, fieldnames = read_csv_rows(action_file)
     except Exception as e:
-        print(f'[跳过] {ep_dir}: 动作 CSV 解析失败 -> {e}')
+        print(f'[Skip] {ep_dir}: failed to parse action CSV -> {e}')
         return
 
     n = len(rows)
     if len(images) != n:
-        print(f'[跳过] {ep_dir}: 图片数与 sequence_debug.csv 行数不一致，无法安全同步删除。 csv_rows={n}, images={len(images)}')
+        print(f'[Skip] {ep_dir}: image count and sequence_debug.csv rows differ; cannot safely prune in sync. csv_rows={n}, images={len(images)}')
         return
 
     drop_indices, grasp_event_indices = detect_drop_indices(
@@ -281,22 +281,22 @@ def process_episode(
     )
 
     if not drop_indices:
-        print(f'[保留] {ep_dir.name}: 未发现需要删除的长静止段（检测到夹爪事件 {len(grasp_event_indices)} 次）')
+        print(f'[Keep] {ep_dir.name}: no long static segment to remove (detected gripper events: {len(grasp_event_indices)}  )')
         return
 
     keep_indices = [i for i in range(n) if i not in set(drop_indices)]
     removed_images = [images[i] for i in drop_indices]
 
-    print(f'[检测到] {ep_dir.name}: 总帧数={n}, 删除={len(drop_indices)}, 保留={len(keep_indices)}, 夹爪事件={len(grasp_event_indices)}')
+    print(f'[Detected] {ep_dir.name}: total={n}, drop={len(drop_indices)}, keep={len(keep_indices)}, gripper_events={len(grasp_event_indices)}')
 
     if not apply:
         preview = drop_indices[:20]
         more = ' ...' if len(drop_indices) > 20 else ''
-        print(f'  dry-run: 将删除下标 {preview}{more}')
+        print(f'  dry-run: indices to remove {preview}{more}')
         if metadata_file and metadata_file.is_file():
-            print(f'  dry-run: 将同步裁剪 CSV -> {metadata_file}')
+            print(f'  dry-run: will prune CSV -> {metadata_file}')
         if raw_txt_file and raw_txt_file.is_file():
-            print(f'  dry-run: 将尝试同步裁剪 TXT -> {raw_txt_file}')
+            print(f'  dry-run: will attempt TXT prune -> {raw_txt_file}')
         return
 
     backup_root = ep_dir / '.backup_before_clean'
@@ -315,31 +315,31 @@ def process_episode(
             p.unlink()
             deleted += 1
         except Exception as e:
-            print(f'  [警告] 删除图片失败 {p}: {e}')
+            print(f'  [WARN] Failed to delete image {p}: {e}')
 
-    print(f'  [完成] 已写回 CSV，并删除图片 {deleted}/{len(removed_images)} 张')
+    print(f'  [Done] CSV written back, images deleted {deleted}/{len(removed_images)} ')
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='清洗 dataset_episodes 中长静止片段，并同步删除对应图片')
-    parser.add_argument('--root', type=str, required=True, help='dataset_episodes 根目录，或单个 episode 目录')
-    parser.add_argument('--apply', action='store_true', help='真正执行；默认只 dry-run')
-    parser.add_argument('--debug-find', action='store_true', help='打印找到的候选 episode 目录，便于排查路径问题')
+    parser = argparse.ArgumentParser(description='Clean long static segments in dataset_episodes and synchronously delete corresponding images')
+    parser.add_argument('--root', type=str, required=True, help='dataset_episodes root, or a single episode directory')
+    parser.add_argument('--apply', action='store_true', help='Apply changes; default is dry-run only')
+    parser.add_argument('--debug-find', action='store_true', help='Print discovered episode candidates for path debugging')
 
-    parser.add_argument('--action-rel', type=str, default='trajectory/sequence_debug.csv', help='相对 episode 目录的动作 CSV 路径')
-    parser.add_argument('--image-rel', type=str, default='camera/rgb_224', help='相对 episode 目录的图片目录路径')
-    parser.add_argument('--metadata-rel', type=str, default='camera/metadata.CSV', help='相对 episode 目录的相机 metadata CSV 路径；不存在会自动跳过')
-    parser.add_argument('--raw-txt-rel', type=str, default='trajectory/sequence_raw.txt', help='相对 episode 目录的原始 txt 路径；若每行对应一帧则同步裁剪')
-    parser.add_argument('--episode-prefix', type=str, default='episode_', help='episode 目录前缀，默认 episode_；不想限制就传空字符串')
+    parser.add_argument('--action-rel', type=str, default='trajectory/sequence_debug.csv', help='Action CSV path relative to episode directory')
+    parser.add_argument('--image-rel', type=str, default='camera/rgb_224', help='Image directory path relative to episode directory')
+    parser.add_argument('--metadata-rel', type=str, default='camera/metadata.CSV', help='Camera metadata CSV path relative to episode directory; skipped if missing')
+    parser.add_argument('--raw-txt-rel', type=str, default='trajectory/sequence_raw.txt', help='Raw txt path relative to episode directory; pruned in sync when line count matches frames')
+    parser.add_argument('--episode-prefix', type=str, default='episode_', help='Episode prefix (default episode_); pass empty string to disable')
 
-    parser.add_argument('--trans-thresh', type=float, default=0.0025, help='近静止判定：平移阈值（默认 0.0025 米）')
-    parser.add_argument('--rot-thresh', type=float, default=0.03, help='近静止判定：旋转阈值（默认 0.03 rad）')
-    parser.add_argument('--grip-stable-thresh', type=float, default=1e-6, help='近静止判定：夹爪变化阈值，小于此值视为夹爪未变化')
-    parser.add_argument('--grip-event-thresh', type=float, default=0.05, help='判断夹爪发生明显变化的阈值')
-    parser.add_argument('--min-static-len', type=int, default=8, help='连续静止长度达到该值才裁剪（默认 8 帧）')
-    parser.add_argument('--keep-static-frames', type=int, default=2, help='普通长静止段保留前几帧（默认 2）')
-    parser.add_argument('--fps', type=float, default=10.0, help='采样频率，用于把保护秒数换算成帧数（默认 10Hz）')
-    parser.add_argument('--protect-after-grasp-seconds', type=float, default=5, help='夹爪发生明显变化后，保护多少秒内的帧不删除（默认 3 秒）')
+    parser.add_argument('--trans-thresh', type=float, default=0.0025, help='Near-static threshold: translation (default 0.0025 m)')
+    parser.add_argument('--rot-thresh', type=float, default=0.03, help='Near-static threshold: rotation (default 0.03 rad)')
+    parser.add_argument('--grip-stable-thresh', type=float, default=1e-6, help='Near-static threshold: gripper delta; below this value is considered unchanged')
+    parser.add_argument('--grip-event-thresh', type=float, default=0.05, help='Threshold for significant gripper change events')
+    parser.add_argument('--min-static-len', type=int, default=8, help='Prune only if static segment length reaches this value (default 8 frames)')
+    parser.add_argument('--keep-static-frames', type=int, default=2, help='Keep first N frames in normal long static segments (default 2)')
+    parser.add_argument('--fps', type=float, default=10.0, help='Sampling rate to convert protection seconds into frames (default 10Hz)')
+    parser.add_argument('--protect-after-grasp-seconds', type=float, default=5, help='After significant gripper change, protect frames in this many seconds from deletion (default 3s)')
     return parser.parse_args()
 
 
@@ -347,7 +347,7 @@ def main() -> None:
     args = parse_args()
     root = Path(args.root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
-        raise FileNotFoundError(f'目录不存在: {root}')
+        raise FileNotFoundError(f'Directory does not exist: {root}')
 
     episode_dirs = collect_episode_dirs(root, args.action_rel, args.image_rel, args.episode_prefix, recursive=True)
     if args.debug_find:
@@ -355,25 +355,25 @@ def main() -> None:
         print(f'[DEBUG] action_rel = {args.action_rel}')
         print(f'[DEBUG] image_rel = {args.image_rel}')
         if episode_dirs:
-            print('[DEBUG] 找到的候选 episode:')
+            print('[DEBUG] Discovered episode candidates:')
             for ep in episode_dirs:
                 print(f'  - {ep}')
         else:
-            print('[DEBUG] 没有找到候选 episode。')
-            print('[DEBUG] 你可以手动检查：')
+            print('[DEBUG] No episode candidates found.')
+            print('[DEBUG] You can manually check:')
             print(f'  find {root} -path "*/{args.action_rel}"')
             print(f'  find {root} -path "*/{args.image_rel}"')
 
     if not episode_dirs:
-        print('未找到任何可处理的 episode 目录。')
-        print(f'请检查是否存在：*/{args.action_rel} 和 */{args.image_rel}')
+        print('No processable episode directory found.')
+        print(f'Please check existence of:*/{args.action_rel}  and  */{args.image_rel}')
         return
 
-    print(f'找到 {len(episode_dirs)} 个 episode 目录')
-    print(f"{'执行模式: APPLY' if args.apply else '执行模式: DRY-RUN'}")
-    print(f'参数: trans_thresh={args.trans_thresh}, rot_thresh={args.rot_thresh}, min_static_len={args.min_static_len}, keep_static_frames={args.keep_static_frames}, fps={args.fps}, protect_after_grasp_seconds={args.protect_after_grasp_seconds}')
-    print(f'主 CSV: {args.action_rel}')
-    print(f'图片目录: {args.image_rel}')
+    print(f'Found {len(episode_dirs)} episode directories')
+    print(f"{'Mode: APPLY' if args.apply else 'Mode: DRY-RUN'}")
+    print(f'Parameters: trans_thresh={args.trans_thresh}, rot_thresh={args.rot_thresh}, min_static_len={args.min_static_len}, keep_static_frames={args.keep_static_frames}, fps={args.fps}, protect_after_grasp_seconds={args.protect_after_grasp_seconds}')
+    print(f'Main CSV: {args.action_rel}')
+    print(f'Image dir: {args.image_rel}')
     print()
 
     for ep_dir in episode_dirs:
@@ -395,7 +395,7 @@ def main() -> None:
         )
         print()
 
-    print('全部处理完成。')
+    print('All processing complete.')
 
 
 if __name__ == '__main__':

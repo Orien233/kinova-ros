@@ -2,22 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-自动化训练集录制脚本。
+Automated dataset episode recording orchestrator.
 
-当前对齐点：
-1. 默认调用 sequence_player_position_verified.py 进行回放。
-2. 若未显式指定输入序列，则自动读取脚本目录下 teach_sessions 中最新一次示教结果。
-3. 对 verified 播放优先选择 *_pose.txt / sequence_pose.txt 这类绝对位姿序列；找不到时再回退到 raw/normalized 序列。
-4. 同步启动 sequence_recorder.py 与 RealSense 采集。
-5. recorder 额外产出 sequence_pose.txt，并保存到 trajectory 目录。
-6. 每轮数据写入独立 episode 时间戳文件夹，避免覆盖。
-7. 采集结束后自动删除原始 RGB 图，只保留裁剪后的 rgb_224。
+Current behavior alignment:
+1. Replays sequences with sequence_player_position_verified.py by default.
+2. If no input sequence is provided, it auto-loads the latest teach session under tools/teach_sessions.
+3. For verified playback, it prefers absolute pose files (*_pose.txt / sequence_pose.txt), then falls back to raw/normalized action files.
+4. Starts sequence_recorder.py and RealSense capture in parallel.
+5. Recorder additionally writes sequence_pose.txt in the trajectory directory.
+6. Each run writes to a unique timestamped episode folder to avoid overwrite.
+7. After recording, it removes raw RGB frames and keeps only cropped rgb_224.
 
-说明：
-- 本脚本本身不直接依赖 rospy/tf，可由 python 或 python3 启动。
-- 子脚本解释器会分别选择：
-  - player / recorder: 在 Melodic 下优先 python2/python
-  - camera: 优先 python3
+Notes:
+- This script does not directly depend on rospy/tf; it can run via python or python3.
+- Child interpreters are selected by role:
+  - player / recorder: prefer python2/python on ROS Melodic
+  - camera: prefer python3
 """
 
 from __future__ import print_function
@@ -45,18 +45,18 @@ DEFAULT_TEACH_ROOT = os.path.join(THIS_DIR, 'teach_sessions')
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Replay one sequence and record one dataset episode.')
-    parser.add_argument('--raw-sequence', default='', help='可选：显式指定输入序列文件；若不指定，则自动读取 teach_sessions 最新序列')
-    parser.add_argument('--teach-root', default=DEFAULT_TEACH_ROOT, help='teach_sessions 根目录；当 --raw-sequence 为空时使用')
-    parser.add_argument('--output-root', default=DEFAULT_OUTPUT_ROOT, help='episode 根目录；相对路径按脚本目录解析')
-    parser.add_argument('--episode-prefix', default='episode', help='episode 文件夹前缀')
+    parser.add_argument('--raw-sequence', default='', help='Optional explicit input sequence; if omitted, auto-load latest sequence from teach_sessions')
+    parser.add_argument('--teach-root', default=DEFAULT_TEACH_ROOT, help='teach_sessions root; used when --raw-sequence is empty')
+    parser.add_argument('--output-root', default=DEFAULT_OUTPUT_ROOT, help='Episode root directory; relative paths are resolved from this script directory')
+    parser.add_argument('--episode-prefix', default='episode', help='Episode folder prefix')
 
-    parser.add_argument('--player-python', default='auto', help='player 使用的解释器')
-    parser.add_argument('--recorder-python', default='auto', help='recorder 使用的解释器')
-    parser.add_argument('--camera-python', default='auto', help='camera 使用的解释器')
+    parser.add_argument('--player-python', default='auto', help='Interpreter for player script')
+    parser.add_argument('--recorder-python', default='auto', help='Interpreter for recorder script')
+    parser.add_argument('--camera-python', default='auto', help='Interpreter for camera script')
 
-    parser.add_argument('--player-script', default=DEFAULT_PLAYER, help='player 脚本路径')
-    parser.add_argument('--recorder-script', default=DEFAULT_RECORDER, help='recorder 脚本路径')
-    parser.add_argument('--camera-script', default=DEFAULT_CAMERA, help='camera 脚本路径')
+    parser.add_argument('--player-script', default=DEFAULT_PLAYER, help='Player script path')
+    parser.add_argument('--recorder-script', default=DEFAULT_RECORDER, help='Recorder script path')
+    parser.add_argument('--camera-script', default=DEFAULT_CAMERA, help='Camera script path')
 
     parser.add_argument('--robot-type', default='j2s6s300')
     parser.add_argument('--startup-wait', type=float, default=0.8)
@@ -66,7 +66,7 @@ def parse_args():
     # position_verified player params
     parser.add_argument('--sequence-kind', default='auto', choices=['auto', 'absolute_pose', 'delta_action'])
     parser.add_argument('--action-mode', default='delta', choices=['delta', 'absolute'])
-    parser.add_argument('--input-scale', type=float, default=1.0, help='兼容旧参数；会同时乘到 translation/rotation scale 上')
+    parser.add_argument('--input-scale', type=float, default=1.0, help='Backward-compatible scalar, multiplied into both translation/rotation scales')
     parser.add_argument('--translation-scale', type=float, default=1.0)
     parser.add_argument('--rotation-scale', type=float, default=1.0)
     parser.add_argument('--use-orientation', action='store_true')
@@ -240,14 +240,14 @@ def write_json(path_value, payload):
 def find_latest_teach_session(teach_root):
     teach_root = resolve_local_path(teach_root)
     if not os.path.isdir(teach_root):
-        raise RuntimeError('teach_sessions 根目录不存在: %s' % teach_root)
+        raise RuntimeError('teach_sessions root does not exist: %s' % teach_root)
     subdirs = []
     for name in os.listdir(teach_root):
         path_value = os.path.join(teach_root, name)
         if os.path.isdir(path_value):
             subdirs.append(path_value)
     if not subdirs:
-        raise RuntimeError('teach_sessions 中没有找到任何示教会话目录: %s' % teach_root)
+        raise RuntimeError('No teach session directories found in teach_sessions: %s' % teach_root)
     subdirs.sort(key=lambda p: (os.path.getmtime(p), p), reverse=True)
     return subdirs[0]
 
@@ -255,7 +255,7 @@ def find_latest_teach_session(teach_root):
 def pick_preferred_sequence_from_session(session_dir):
     trajectory_dir = os.path.join(session_dir, 'trajectory')
     if not os.path.isdir(trajectory_dir):
-        raise RuntimeError('最新 teach session 缺少 trajectory 目录: %s' % session_dir)
+        raise RuntimeError('Latest teach session is missing trajectory directory: %s' % session_dir)
 
     candidates = []
 
@@ -274,7 +274,7 @@ def pick_preferred_sequence_from_session(session_dir):
             candidates.append(path_value)
 
     if not candidates:
-        raise RuntimeError('在最新 teach session 中没有找到可用序列文件: %s' % trajectory_dir)
+        raise RuntimeError('No usable sequence file found in latest teach session: %s' % trajectory_dir)
     return candidates[0], trajectory_dir, candidates
 
 
@@ -283,7 +283,7 @@ def resolve_input_sequence(args):
     if requested:
         path_value = os.path.abspath(requested)
         if not os.path.isfile(path_value):
-            raise RuntimeError('显式指定的序列文件不存在: %s' % path_value)
+            raise RuntimeError('Explicitly specified sequence file does not exist: %s' % path_value)
         return {
             'mode': 'manual',
             'sequence_file': path_value,
