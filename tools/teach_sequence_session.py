@@ -4,14 +4,14 @@
 from __future__ import print_function
 
 """
-示教动作录制总控脚本。
+Teaching-session recording orchestrator.
 
-本次对齐修改：
-1. 默认输出根目录固定为脚本目录下的 teach_sessions。
-2. 每次开始示教都会创建独立时间戳文件夹，不覆盖上次结果。
-3. 调用新版 sequence_recorder.py，显式保存：
+Current alignment updates:
+1. Default output root is tools/teach_sessions.
+2. Each teaching run creates a unique timestamped folder; no overwrite.
+3. Calls sequence_recorder.py and explicitly saves:
    sequence.txt / sequence_raw.txt / sequence_pose.txt / sequence_debug.csv / sequence_stats.json
-4. 恢复逻辑仍保持“初始关节优先，末端位姿兜底，home 后重试”。
+4. Restore logic remains: initial joints first, pose fallback, then home-and-retry.
 """
 
 import argparse
@@ -51,9 +51,9 @@ def maybe_reexec_to_python2_for_melodic():
         return
     py2 = _find_executable('python2') or _find_executable('python')
     if not py2:
-        sys.stderr.write('[ERROR] 检测到 ROS Melodic + python3，但未找到 python2/python。\n')
+        sys.stderr.write('[ERROR] Detected ROS Melodic + python3, but python2/python was not found.\n')
         sys.exit(2)
-    sys.stderr.write('[WARN] 检测到 ROS Melodic + python3，自动切换到 %s 重新执行。\n' % py2)
+    sys.stderr.write('[WARN] Detected ROS Melodic + python3; re-executing with %s.\n' % py2)
     os.execvp(py2, [py2, os.path.abspath(__file__)] + sys.argv[1:])
 
 
@@ -98,9 +98,9 @@ from finger_telep_oc import FingerTeleopModeSwitch
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Teach and record Kinova sequence with one-key start/stop.')
-    parser.add_argument('--output-root', default=DEFAULT_OUTPUT_ROOT, help='示教会话根目录；相对路径按脚本目录解析')
-    parser.add_argument('--session-prefix', default='teach', help='会话文件夹前缀')
-    parser.add_argument('--recorder-python', default='auto', help='sequence_recorder.py 使用的解释器')
+    parser.add_argument('--output-root', default=DEFAULT_OUTPUT_ROOT, help='Teach session root directory; relative paths are resolved from this script directory')
+    parser.add_argument('--session-prefix', default='teach', help='Session folder prefix')
+    parser.add_argument('--recorder-python', default='auto', help='Interpreter for sequence_recorder.py')
     parser.add_argument('--recorder-script', default=DEFAULT_RECORDER)
 
     parser.add_argument('--robot-type', default='j2s6s300')
@@ -392,7 +392,7 @@ class TeachSessionManager(object):
 
     def _call_home_arm(self):
         if not HAS_EMPTY:
-            rospy.logwarn('std_srvs/Empty 不可用，无法调用 home_arm。')
+            rospy.logwarn('std_srvs/Empty unavailable; cannot call home_arm.')
             return False
         try:
             rospy.wait_for_service(self.home_srv_name, timeout=3.0)

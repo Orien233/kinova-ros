@@ -2,32 +2,36 @@
 # -*- coding: utf-8 -*-
 
 """
-Sequence player (position-control / pose-action version) for Kinova J2S6S300.
+Cumulative position player for Kinova Cartesian pose actions.
 
-这一版在原来的 position player 基础上，做了两件关键增强：
-1. 支持读取 absolute pose 序列文件：
-       Episode=1, t=24, Pose=[x, y, z, roll, pitch, yaw, gripper_state]
-   这样每一步都直接回到一个绝对位姿，减少 delta 累积误差。
-2. 支持动作完成后的到位复核与重发：
-   在 pose action 返回 success 后，再读取 /out/tool_pose 检查终点误差；
-   若误差仍超阈值，可自动重发 1~N 次，提升终点精度与重复性。
+Core idea:
+1. Read a delta sequence (or absolute sequence).
+2. Capture one startup reference pose pose_0.
+3. Pre-accumulate all targets relative to pose_0 before execution.
+4. Execute precomputed absolute targets step by step.
 
-同时保留对旧格式 delta action 的支持：
-       Episode=1, t=24, Action=[dx, dy, dz, droll, dpitch, dyaw, gripper_state]
+Benefits:
+- No separate pose file required when using delta sequences.
+- Reduces per-step residual error accumulation.
+- Compatible with pose-action / position-control pipelines.
 
-推荐用法：
-- position 回放优先使用 recorder 生成的 sequence_pose.txt
-- 若文件中是 Pose=，将直接按绝对位姿播放
-- 若文件中是 Action=，则按 action_mode 参数解释（默认 delta）
+Data convention:
+- First 3 dims: translation delta in meters.
+- Next 3 dims: orientation delta in radians (Euler XYZ / RPY).
+- 7th dim: optional gripper state.
+
+Recommendation:
+- First test with _use_orientation:=false for position-only verification.
+- Enable orientation after confirming rotational semantics.
 """
 
 from __future__ import print_function
 
-import math
 import os
-
+import math
 import rospy
 import actionlib
+
 import geometry_msgs.msg
 import std_msgs.msg
 from geometry_msgs.msg import PoseStamped
@@ -37,7 +41,7 @@ import kinova_msgs.msg
 try:
     import tf.transformations as tft
 except Exception as exc:
-    raise RuntimeError('无法导入 tf.transformations，请确认 ROS tf 已正确安装: %s' % str(exc))
+    raise RuntimeError('Cannot import tf.transformations; verify ROS tf is installed correctly: %s' % str(exc))
 
 try:
     from kinova_msgs.msg import SetFingersPositionAction, SetFingersPositionGoal
@@ -48,46 +52,45 @@ except Exception:
     HAS_GRIPPER_ACTION = False
 
 
-class PositionSequencePlayer(object):
+class CumulativePositionSequencePlayer(object):
     def __init__(self, robot_type='j2s6s300'):
-        rospy.init_node('sequence_player_position_verified', anonymous=True)
+        rospy.init_node('sequence_player_position_cumulative', anonymous=True)
 
         self.robot_type = rospy.get_param('~robot_type', robot_type)
         self.sequence = []
+        self.targets = []
         self.current_step = 0
 
         # -------------------------
-        # 执行参数
+        # Basic execution parameters
         # -------------------------
         self.pause_between_steps = float(rospy.get_param('~pause_between_steps', 0.0))
         self.step_action_timeout = float(rospy.get_param('~step_action_timeout', 8.0))
-        self.wait_pose_timeout = float(rospy.get_param('~wait_pose_timeout', 3.0))
+        self.wait_pose_timeout = float(rospy.get_param('~wait_pose_timeout', 5.0))
         self.driver_ready_sleep = float(rospy.get_param('~driver_ready_sleep', 1.0))
 
         # -------------------------
-        # 文件与动作解释参数
+        # Action interpretation parameters
         # -------------------------
-        # auto | absolute_pose | delta_action
-        self.sequence_kind = rospy.get_param('~sequence_kind', 'auto')
-        # delta | absolute
+        # delta    : first 6 values are interpreted as delta actions (default)
+        # absolute : first 6 values are interpreted as absolute pose (reserved extension)
         self.action_mode = rospy.get_param('~action_mode', 'delta')
+
+        # Scale translation and rotation independently; keep 1.0 for physical-unit inputs
         self.translation_scale = float(rospy.get_param('~translation_scale', 1.0))
         self.rotation_scale = float(rospy.get_param('~rotation_scale', 1.0))
+
+        # Whether to include orientation deltas in target construction
         self.use_orientation = bool(rospy.get_param('~use_orientation', True))
 
-        # -------------------------
-        # 到位复核参数
-        # -------------------------
-        self.verify_goal = bool(rospy.get_param('~verify_goal', True))
-        self.verify_retries = int(rospy.get_param('~verify_retries', 1))
-        self.verify_settle_sec = float(rospy.get_param('~verify_settle_sec', 0.15))
-        self.goal_pos_tolerance = float(rospy.get_param('~goal_pos_tolerance', 5e-4))
-        self.goal_ori_tolerance = float(rospy.get_param('~goal_ori_tolerance', 0.02))
-
+        # Pose action reference frame (typically base link)
         self.base_link = rospy.get_param('~base_link', self.robot_type + '_link_base')
 
+        # Whether to precompute all targets before start (default and recommended)
+        self.cumulative_from_initial = bool(rospy.get_param('~cumulative_from_initial', True))
+
         # -------------------------
-        # tool_pose 订阅缓存
+        # tool_pose subscription cache
         # -------------------------
         self.latest_tool_pose = None
         self.tool_pose_sub = rospy.Subscriber(
@@ -107,7 +110,7 @@ class PositionSequencePlayer(object):
         )
 
         # -------------------------
-        # gripper（可选）
+        # gripper (optional)
         # -------------------------
         self.enable_gripper = bool(rospy.get_param('~enable_gripper', True))
         self.gripper_mode = rospy.get_param('~gripper_mode', 'binary')
@@ -126,17 +129,15 @@ class PositionSequencePlayer(object):
                 SetFingersPositionAction
             )
         elif self.enable_gripper:
-            rospy.logwarn('未能导入 SetFingersPositionAction，夹爪状态将被忽略。')
+            rospy.logwarn('SetFingersPositionAction import failed; gripper state will be ignored.')
 
-        rospy.loginfo('PositionSequencePlayer initialized.')
+        rospy.loginfo('CumulativePositionSequencePlayer initialized.')
         rospy.loginfo('robot_type=%s', self.robot_type)
-        rospy.loginfo('sequence_kind=%s action_mode=%s', self.sequence_kind, self.action_mode)
+        rospy.loginfo('action_mode=%s', self.action_mode)
         rospy.loginfo('translation_scale=%.6f rotation_scale=%.6f',
                       self.translation_scale, self.rotation_scale)
         rospy.loginfo('use_orientation=%s', self.use_orientation)
-        rospy.loginfo('verify_goal=%s retries=%d pos_tol=%.6f ori_tol=%.6f',
-                      self.verify_goal, self.verify_retries,
-                      self.goal_pos_tolerance, self.goal_ori_tolerance)
+        rospy.loginfo('cumulative_from_initial=%s', self.cumulative_from_initial)
         rospy.loginfo('pose_action_address=%s', self.pose_action_address)
         rospy.loginfo('base_link=%s', self.base_link)
 
@@ -147,24 +148,11 @@ class PositionSequencePlayer(object):
         self.latest_tool_pose = msg
 
     # ------------------------------------------------------------------
-    # 数学 / 工具函数
+    # Math / utility functions
     # ------------------------------------------------------------------
     @staticmethod
     def _clip(value, low, high):
         return max(low, min(high, value))
-
-    @staticmethod
-    def _normalize_angle_diff(curr, prev):
-        d = curr - prev
-        while d > math.pi:
-            d -= 2.0 * math.pi
-        while d < -math.pi:
-            d += 2.0 * math.pi
-        return d
-
-    @staticmethod
-    def _norm3(vec3):
-        return math.sqrt(vec3[0] * vec3[0] + vec3[1] * vec3[1] + vec3[2] * vec3[2])
 
     @staticmethod
     def _pose_to_pos_quat(pose_msg):
@@ -184,12 +172,26 @@ class PositionSequencePlayer(object):
         quat = tft.quaternion_from_euler(roll, pitch, yaw)
         return [float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])]
 
+    @staticmethod
+    def _quat_to_matrix(quat_xyzw):
+        return tft.quaternion_matrix(quat_xyzw)
+
+    @staticmethod
+    def _matrix_to_quat(mat44):
+        quat = tft.quaternion_from_matrix(mat44)
+        return [float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])]
+
+    @staticmethod
+    def _round_list(values, ndigits=6):
+        return [round(v, ndigits) for v in values]
+
     # ------------------------------------------------------------------
-    # 读取当前末端位姿
+    # Current end-effector pose
     # ------------------------------------------------------------------
     def wait_for_pose(self, timeout_sec=None):
         if timeout_sec is None:
             timeout_sec = self.wait_pose_timeout
+
         t0 = rospy.Time.now().to_sec()
         rate = rospy.Rate(50)
         while not rospy.is_shutdown():
@@ -201,59 +203,63 @@ class PositionSequencePlayer(object):
         return False
 
     def get_current_tool_pose(self):
+        """
+        Read current end-effector pose.
+
+        Returns:
+            pos  : [x, y, z]，meters
+            quat : [qx, qy, qz, qw]
+            rpy  : [roll, pitch, yaw]，radians
+        """
         if not self.wait_for_pose(timeout_sec=self.wait_pose_timeout):
-            raise RuntimeError('等待 /%s_driver/out/tool_pose 超时。' % self.robot_type)
+            raise RuntimeError('Timeout while waiting for /%s_driver/out/tool_pose.' % self.robot_type)
+
         msg = self.latest_tool_pose
         pos, quat = self._pose_to_pos_quat(msg)
         rpy = self._quat_to_rpy(quat)
         return pos, quat, rpy
 
     # ------------------------------------------------------------------
-    # 解析 sequence 文件
+    # Parse sequence file
     # ------------------------------------------------------------------
     def parse_sequence_file(self, filename):
+        """
+        Supported formats:
+            Episode=1, t=24, Action=[dx, dy, dz, dr, dp, dy, g]
+
+        Returns:
+            [
+              {
+                'delta_pose': [6 values],
+                'gripper': optional float
+              },
+              ...
+            ]
+        """
         sequences = []
         try:
             with open(filename, 'r') as f:
                 for line in f:
-                    line = line.strip()
-                    if not line:
+                    if 'Action=' not in line:
                         continue
-
-                    kind = None
-                    payload = None
-                    if 'Pose=' in line:
-                        kind = 'absolute_pose'
-                        payload = line.split('Pose=')[1].strip().strip('[]')
-                    elif 'Action=' in line:
-                        kind = 'delta_action' if self.action_mode == 'delta' else 'absolute_pose'
-                        payload = line.split('Action=')[1].strip().strip('[]')
-                    else:
-                        continue
-
-                    if self.sequence_kind == 'absolute_pose':
-                        kind = 'absolute_pose'
-                    elif self.sequence_kind == 'delta_action':
-                        kind = 'delta_action'
-
-                    values = [float(x.strip()) for x in payload.split(',')]
+                    action_str = line.split('Action=')[1].strip().strip('[]')
+                    values = [float(x.strip()) for x in action_str.split(',')]
                     if len(values) < 6:
-                        rospy.logwarn('Skip invalid line: %s', line)
+                        rospy.logwarn('Skip invalid action line: %s', line.strip())
                         continue
 
                     entry = {
-                        'kind': kind,
-                        'pose_or_delta': values[:6],
+                        'delta_pose': values[:6],
                         'gripper': values[6] if len(values) >= 7 else None,
                     }
                     sequences.append(entry)
             return sequences
-        except Exception as exc:
-            rospy.logerr('Error parsing file %s: %s', filename, exc)
+        except Exception as e:
+            rospy.logerr('Error parsing file %s: %s', filename, e)
             return []
 
     # ------------------------------------------------------------------
-    # 夹爪辅助
+    # Gripper helpers
     # ------------------------------------------------------------------
     def wait_for_gripper_server(self):
         if self.gripper_client is None:
@@ -267,71 +273,138 @@ class PositionSequencePlayer(object):
     def gripper_state_to_turn(self, gripper_state):
         if gripper_state is None:
             return None
+
         if self.gripper_mode == 'continuous':
             alpha = self._clip(float(gripper_state), 0.0, 1.0)
             return self.gripper_open_turn + alpha * (self.gripper_closed_turn - self.gripper_open_turn)
+
+        # binary
         return self.gripper_closed_turn if float(gripper_state) > self.gripper_threshold else self.gripper_open_turn
 
     def maybe_execute_gripper(self, gripper_state):
+        """
+        Send a gripper command only when the state changes.
+        """
         if not self.enable_gripper or gripper_state is None or self.gripper_client is None:
             return True
+
         if self.last_gripper_state is not None:
             if abs(float(gripper_state) - float(self.last_gripper_state)) <= self.gripper_change_tolerance:
                 return True
+
         target_turn = self.gripper_state_to_turn(gripper_state)
         if target_turn is None:
             return True
+
         try:
             goal = SetFingersPositionGoal()
             goal.fingers.finger1 = float(target_turn)
             goal.fingers.finger2 = float(target_turn)
             goal.fingers.finger3 = 0.0
-            rospy.loginfo('Send gripper goal | state=%.4f target_turn=%.2f', float(gripper_state), target_turn)
+
+            rospy.loginfo('Send gripper goal | state=%.4f target_turn=%.2f',
+                          float(gripper_state), target_turn)
             self.gripper_client.send_goal(goal)
+
             if self.gripper_blocking:
                 finished = self.gripper_client.wait_for_result(rospy.Duration(self.gripper_action_timeout))
                 if not finished:
                     rospy.logwarn('Gripper action timeout after %.2f sec', self.gripper_action_timeout)
+
             self.last_gripper_state = float(gripper_state)
             return True
-        except Exception as exc:
-            rospy.logwarn('Failed to execute gripper command: %s', exc)
+        except Exception as e:
+            rospy.logwarn('Failed to execute gripper command: %s', e)
             return False
 
     # ------------------------------------------------------------------
-    # 构造目标位姿
+    # Pre-accumulated targets
     # ------------------------------------------------------------------
-    def build_step_target(self, start_pos, start_rpy, entry):
-        raw = list(entry['pose_or_delta'])
-        pos_part = [self.translation_scale * float(v) for v in raw[:3]]
-        rpy_part = [self.rotation_scale * float(v) for v in raw[3:6]]
+    def build_targets_from_initial_pose(self, initial_pos, initial_quat, initial_rpy):
+        """
+        Use a single startup reference pose and pre-accumulate the full delta sequence,
+        to construct absolute targets for each step.
 
-        if entry['kind'] == 'absolute_pose':
-            target_pos = list(pos_part)
-            if self.use_orientation:
-                target_rpy = list(rpy_part)
-            else:
-                target_rpy = list(start_rpy)
-        else:
-            target_pos = [
-                start_pos[0] + pos_part[0],
-                start_pos[1] + pos_part[1],
-                start_pos[2] + pos_part[2],
+        For delta mode:
+            target_1 = pose_0 + delta_1
+            target_2 = pose_0 + delta_1 + delta_2
+            ...
+
+        For absolute mode:
+            Treat the first 6 sequence values directly as absolute target.
+
+        Returns:
+            [
+              {
+                'target_pos': [x, y, z],
+                'target_quat': [qx, qy, qz, qw],
+                'target_rpy': [r, p, y],
+                'used_delta': [6],
+                'gripper': optional float,
+              },
+              ...
             ]
-            if self.use_orientation:
-                target_rpy = [
-                    start_rpy[0] + rpy_part[0],
-                    start_rpy[1] + rpy_part[1],
-                    start_rpy[2] + rpy_part[2],
-                ]
-            else:
-                target_rpy = list(start_rpy)
+        """
+        targets = []
 
-        target_quat = self._rpy_to_quat(target_rpy[0], target_rpy[1], target_rpy[2])
-        return target_pos, target_quat, target_rpy, pos_part + rpy_part
+        # Accumulate both position and rotation from the initial reference pose
+        cumulative_pos = [float(initial_pos[0]), float(initial_pos[1]), float(initial_pos[2])]
+        cumulative_rot = self._quat_to_matrix(initial_quat)
+
+        for idx, entry in enumerate(self.sequence):
+            raw_delta = list(entry['delta_pose'])
+            gripper_state = entry['gripper']
+
+            # Scale translation and rotation separately
+            delta_pos = [self.translation_scale * float(v) for v in raw_delta[:3]]
+            delta_rpy = [self.rotation_scale * float(v) for v in raw_delta[3:6]]
+            used_delta = delta_pos + delta_rpy
+
+            if self.action_mode == 'absolute':
+                # absolute mode: interpret values as absolute target pose
+                target_pos = [delta_pos[0], delta_pos[1], delta_pos[2]]
+                if self.use_orientation:
+                    target_quat = self._rpy_to_quat(delta_rpy[0], delta_rpy[1], delta_rpy[2])
+                    target_rot = self._quat_to_matrix(target_quat)
+                else:
+                    target_quat = list(initial_quat)
+                    target_rot = self._quat_to_matrix(target_quat)
+                target_rpy = self._quat_to_rpy(target_quat)
+
+                # Synchronize accumulators to current absolute target for consistent start_step semantics
+                cumulative_pos = list(target_pos)
+                cumulative_rot = target_rot.copy()
+            else:
+                # delta mode: accumulate from initial pose
+                cumulative_pos[0] += delta_pos[0]
+                cumulative_pos[1] += delta_pos[1]
+                cumulative_pos[2] += delta_pos[2]
+                target_pos = list(cumulative_pos)
+
+                if self.use_orientation:
+                    # Use rotation-matrix accumulation; more stable than direct RPY summation
+                    delta_rot = tft.euler_matrix(delta_rpy[0], delta_rpy[1], delta_rpy[2])
+                    cumulative_rot = tft.concatenate_matrices(cumulative_rot, delta_rot)
+                target_quat = self._matrix_to_quat(cumulative_rot)
+                target_rpy = self._quat_to_rpy(target_quat)
+
+            targets.append({
+                'target_pos': target_pos,
+                'target_quat': target_quat,
+                'target_rpy': target_rpy,
+                'used_delta': used_delta,
+                'gripper': gripper_state,
+            })
+
+            rospy.logdebug('Prebuilt target step=%d pos=%s rpy=%s',
+                           idx + 1,
+                           self._round_list(target_pos, 6),
+                           self._round_list(target_rpy, 6))
+
+        return targets
 
     # ------------------------------------------------------------------
-    # Pose action 执行与复核
+    # Pose action execution
     # ------------------------------------------------------------------
     def wait_for_pose_server(self):
         rospy.loginfo('Waiting for pose action server: %s', self.pose_action_address)
@@ -343,94 +416,63 @@ class PositionSequencePlayer(object):
     def send_pose_goal(self, target_pos, target_quat, timeout_sec=None):
         if timeout_sec is None:
             timeout_sec = self.step_action_timeout
+
         goal = kinova_msgs.msg.ArmPoseGoal()
         goal.pose.header = std_msgs.msg.Header(frame_id=self.base_link)
         goal.pose.pose.position = geometry_msgs.msg.Point(
-            x=float(target_pos[0]), y=float(target_pos[1]), z=float(target_pos[2])
+            x=float(target_pos[0]),
+            y=float(target_pos[1]),
+            z=float(target_pos[2])
         )
         goal.pose.pose.orientation = geometry_msgs.msg.Quaternion(
-            x=float(target_quat[0]), y=float(target_quat[1]), z=float(target_quat[2]), w=float(target_quat[3])
+            x=float(target_quat[0]),
+            y=float(target_quat[1]),
+            z=float(target_quat[2]),
+            w=float(target_quat[3])
         )
+
         rospy.loginfo('Send pose goal | pos=%s quat=%s',
-                      [round(v, 6) for v in target_pos], [round(v, 6) for v in target_quat])
+                      self._round_list(target_pos, 6),
+                      self._round_list(target_quat, 6))
+
         self.pose_client.send_goal(goal)
+
         finished = self.pose_client.wait_for_result(rospy.Duration(timeout_sec))
         if not finished:
             self.pose_client.cancel_all_goals()
             rospy.logwarn('Pose action timeout after %.2f sec', timeout_sec)
             return False
+
         state = self.pose_client.get_state()
         rospy.loginfo('Pose action finished | state=%s', str(state))
         return True
 
-    def verify_pose_goal(self, target_pos, target_rpy):
-        if not self.verify_goal:
-            return True, None, None, None
-        if self.verify_settle_sec > 0.0:
-            rospy.sleep(self.verify_settle_sec)
-        current_pos, current_quat, current_rpy = self.get_current_tool_pose()
-        pos_err_vec = [
-            target_pos[0] - current_pos[0],
-            target_pos[1] - current_pos[1],
-            target_pos[2] - current_pos[2],
-        ]
-        pos_err = self._norm3(pos_err_vec)
-        ori_err = 0.0
-        if self.use_orientation:
-            ori_err_vec = [
-                self._normalize_angle_diff(target_rpy[0], current_rpy[0]),
-                self._normalize_angle_diff(target_rpy[1], current_rpy[1]),
-                self._normalize_angle_diff(target_rpy[2], current_rpy[2]),
-            ]
-            ori_err = self._norm3(ori_err_vec)
-        ok = (pos_err <= self.goal_pos_tolerance) and ((not self.use_orientation) or (ori_err <= self.goal_ori_tolerance))
-        return ok, current_pos, pos_err, ori_err
-
-    def send_pose_goal_with_verification(self, target_pos, target_quat, target_rpy, timeout_sec=None):
-        attempts = max(self.verify_retries, 0) + 1
-        for attempt in range(attempts):
-            success = self.send_pose_goal(target_pos, target_quat, timeout_sec=timeout_sec)
-            if not success:
-                continue
-            ok, current_pos, pos_err, ori_err = self.verify_pose_goal(target_pos, target_rpy)
-            if ok:
-                rospy.loginfo('Goal verified | pos_err=%.6f ori_err=%.6f', pos_err or 0.0, ori_err or 0.0)
-                return True
-            rospy.logwarn('Goal verification failed (attempt %d/%d) | pos_err=%.6f ori_err=%.6f current_pos=%s',
-                          attempt + 1, attempts, pos_err or 0.0, ori_err or 0.0,
-                          [round(v, 6) for v in current_pos] if current_pos is not None else None)
-        return False
-
     # ------------------------------------------------------------------
-    # 单步执行
+    # Single-step execution
     # ------------------------------------------------------------------
     def execute_step(self, step_index):
-        if step_index >= len(self.sequence):
+        if step_index >= len(self.targets):
             rospy.loginfo('Sequence execution completed')
             return False
 
-        entry = self.sequence[step_index]
-        payload = entry['pose_or_delta']
-        gripper_state = entry['gripper']
+        target_entry = self.targets[step_index]
+        gripper_state = target_entry['gripper']
 
-        rospy.loginfo('Step %d/%d | kind=%s | payload=%s | gripper=%s',
-                      step_index + 1, len(self.sequence), entry['kind'],
-                      [round(v, 6) for v in payload], str(gripper_state))
+        rospy.loginfo('Step %d/%d', step_index + 1, len(self.targets))
+        rospy.loginfo('  used_delta=%s', self._round_list(target_entry['used_delta'], 6))
+        rospy.loginfo('  target_pos=%s', self._round_list(target_entry['target_pos'], 6))
+        rospy.loginfo('  target_rpy=%s', self._round_list(target_entry['target_rpy'], 6))
+        rospy.loginfo('  gripper=%s', str(gripper_state))
 
+        # Execute gripper first (if enabled and changed)
         self.maybe_execute_gripper(gripper_state)
 
-        start_pos, start_quat, start_rpy = self.get_current_tool_pose()
-        target_pos, target_quat, target_rpy, used_payload = self.build_step_target(start_pos, start_rpy, entry)
+        success = self.send_pose_goal(
+            target_entry['target_pos'],
+            target_entry['target_quat'],
+            timeout_sec=self.step_action_timeout
+        )
 
-        rospy.loginfo('  start_pos=%s start_rpy=%s',
-                      [round(v, 6) for v in start_pos], [round(v, 6) for v in start_rpy])
-        rospy.loginfo('  used_payload=%s', [round(v, 6) for v in used_payload])
-        rospy.loginfo('  target_pos=%s', [round(v, 6) for v in target_pos])
-        if self.use_orientation:
-            rospy.loginfo('  target_rpy=%s', [round(v, 6) for v in target_rpy])
-
-        success = self.send_pose_goal_with_verification(target_pos, target_quat, target_rpy,
-                                                        timeout_sec=self.step_action_timeout)
         if success:
             rospy.loginfo('Step %d success', step_index + 1)
         else:
@@ -438,7 +480,7 @@ class PositionSequencePlayer(object):
         return success
 
     # ------------------------------------------------------------------
-    # 整段执行
+    # Full sequence execution
     # ------------------------------------------------------------------
     def run_sequence(self, filename, start_step=0):
         self.sequence = self.parse_sequence_file(filename)
@@ -447,23 +489,44 @@ class PositionSequencePlayer(object):
             return False
 
         rospy.loginfo('Loaded %d steps from %s', len(self.sequence), os.path.abspath(filename))
+        rospy.loginfo('Waiting for current tool pose...')
         if not self.wait_for_pose(timeout_sec=5.0):
             rospy.logerr('Timeout waiting for /%s_driver/out/tool_pose', self.robot_type)
             return False
+
         if not self.wait_for_pose_server():
             return False
+
         if self.enable_gripper and self.gripper_client is not None:
             self.wait_for_gripper_server()
+
         rospy.sleep(self.driver_ready_sleep)
 
+        # Capture one reference pose before playback starts
+        initial_pos, initial_quat, initial_rpy = self.get_current_tool_pose()
+        rospy.loginfo('Initial pose captured before sequence execution:')
+        rospy.loginfo('  initial_pos=%s', self._round_list(initial_pos, 6))
+        rospy.loginfo('  initial_rpy=%s', self._round_list(initial_rpy, 6))
+
+        # Pre-accumulate full target pose list
+        if self.cumulative_from_initial:
+            self.targets = self.build_targets_from_initial_pose(initial_pos, initial_quat, initial_rpy)
+        else:
+            # Compatibility note: when cumulative_from_initial is disabled, the old per-step dynamic path is intentionally not implemented.
+            # Raise directly to avoid ambiguous semantics.
+            raise RuntimeError('Current version implements only cumulative_from_initial=True.')
+
         self.current_step = start_step
-        total_steps = len(self.sequence)
-        rospy.loginfo('Start position-control sequence execution | total_steps=%d', total_steps)
+        total_steps = len(self.targets)
+        rospy.loginfo('Start cumulative position-control sequence execution | total_steps=%d', total_steps)
+
         while self.current_step < total_steps and not rospy.is_shutdown():
             success = self.execute_step(self.current_step)
             self.current_step += 1
+
             if not success:
                 rospy.logwarn('Skipping failed step %d', self.current_step)
+
             if self.pause_between_steps > 0.0:
                 rospy.sleep(self.pause_between_steps)
 
@@ -472,16 +535,16 @@ class PositionSequencePlayer(object):
 
 
 def main():
-    player = PositionSequencePlayer(robot_type='j2s6s300')
-    sequence_file = rospy.get_param('~sequence_file', 'sequence_pose.txt')
+    player = CumulativePositionSequencePlayer(robot_type='j2s6s300')
+    sequence_file = rospy.get_param('~sequence_file', 'sequence.txt')
     start_step = int(rospy.get_param('~start_step', 0))
 
     try:
         player.run_sequence(sequence_file, start_step=start_step)
     except KeyboardInterrupt:
         rospy.loginfo('Sequence execution interrupted by user')
-    except Exception as exc:
-        rospy.logerr('Sequence execution error: %s', exc)
+    except Exception as e:
+        rospy.logerr('Sequence execution error: %s', e)
 
 
 if __name__ == '__main__':

@@ -4,16 +4,16 @@
 from __future__ import print_function
 
 """
-Kinova 示教/夹爪控制脚本（ROS Melodic 友好版）。
+Kinova teaching/gripper control script (ROS Melodic friendly).
 
-功能：
-1. 键盘控制夹爪开合。
-2. 在 trajectory / torque(gravity) 模式之间切换。
-3. 提供 FingerTeleopModeSwitch 类，供其他脚本复用。
+Features:
+1. Keyboard-based gripper open/close control.
+2. Switch between trajectory mode and torque (gravity-compensated) mode.
+3. Provides FingerTeleopModeSwitch for reuse in other scripts.
 
-兼容性说明：
-- 使用 Python 2/3 兼容写法，适合 ROS Melodic。
-- 不依赖 Python 3 专属语法（f-string、type hint、pathlib 等）。
+Compatibility notes:
+- Uses Python 2/3 compatible syntax for ROS Melodic.
+- Avoids Python 3-only features (f-strings, type hints, pathlib, etc.).
 """
 
 import select

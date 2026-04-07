@@ -2,6 +2,7 @@
 - [Important](#important) 
 - [Supported versions](#supported-versions)
 - [Kinova-ROS](#kinova-ros)
+  - [Tools scripts workflow](#tools-scripts-workflow)
   - [Installation](#installation)
   - [File System](#file-system)
   - [How to use the stack](#how-to-use-the-stack)
@@ -86,6 +87,24 @@ sudo cp kinova_driver/udev/10-kinova-arm.rules /etc/udev/rules.d/
  - `kinova_gazebo`: ros package to launch a Gazebo simulation.
  - `kinova_moveit`: Everything related to Moveit! is stored here.
  - `kinova_msgs`: all the messages, servers and actionlib format are defined here.
+
+
+## Tools scripts workflow
+
+A dedicated `tools/` directory now groups the dataset-related scripts that were previously in the repository root.
+
+- Main documentation: `tools/README.md`
+- Included scripts:
+  - `tools/auto_dataset_recorder.py`
+  - `tools/clean_static_segments_dataset_episodes_v2.py`
+  - `tools/finger_telep_oc.py`
+  - `tools/record_realsense_rgb_224.py`
+  - `tools/sequence_player_position_cumulative.py`
+  - `tools/sequence_player_position_verified.py`
+  - `tools/sequence_recorder.py`
+  - `tools/teach_sequence_session.py`
+
+The tools README explains script responsibilities, collaboration flow, and usage examples in English.
 
 ## How to use the stack
 
